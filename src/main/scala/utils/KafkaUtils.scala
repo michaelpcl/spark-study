@@ -48,7 +48,7 @@ object KafkaUtils {
     * 获取topic 对应分区的偏移量
     * @return
     */
-  def getTopicAndPartitionOffsetInfo(soTimeOut:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, (Long, Long)] ={
+  def getTopicAndPartitionOffsetInfo(soTimeout:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, (Long, Long)] ={
     //定义返回
     val tpsAndPrts = mutable.Map[TopicAndPartition, (Long, Long)]()
 
