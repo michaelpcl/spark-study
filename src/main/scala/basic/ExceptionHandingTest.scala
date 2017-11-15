@@ -29,9 +29,9 @@ object ExceptionHandingTest {
         else if (tempValue > 0.90){
           throw new NoSuchElementException ("大于0.90的异常")
         }
-        else{
+        /*else{
           throw new NoSuchMethodException() ("其他数值的异常")
-        }
+        }*/
       }
 
       /*var tempValue = 0.91
