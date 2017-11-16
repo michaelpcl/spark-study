@@ -3,9 +3,8 @@ package utils
 import kafka.api._
 import kafka.common.{ErrorMapping, TopicAndPartition}
 import kafka.consumer.SimpleConsumer
-import kafka.utils.{Json, ZkUtils}
+import kafka.utils.{Json, ZKGroupTopicDirs, ZkUtils}
 import org.apache.kafka.common.security.JaasUtils
-
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
@@ -43,9 +42,138 @@ object KafkaUtils {
   }
 
 
+  /**
+    * 获取消息
+    *
+    * @param topicAndPartitionMap
+    * @param clientId
+    * @return
+    */
+  def getMessage(topicAndPartitionMap: Map[TopicAndPartition, Long], clientId: String, brokerZkUtils:ZkUtils): Map[(TopicAndPartition, Long), String] ={
+
+    val map = new mutable.HashMap[(TopicAndPartition, Long), String]()
+
+    topicAndPartitionMap.foreach{case (tp, offset) =>{
+      val topic = tp.topic
+      val par = tp.partition
+      // 从zk找到该分区的leader broker的信息
+      val brokerId = brokerZkUtils.getLeaderForPartition(topic, par).get
+      val brokerInfoStr = brokerZkUtils.readDataMaybeNull(ZkUtils.BrokerIdsPath + "/" + brokerId)._1.get
+      val brokerInfo = Json.parseFull(brokerInfoStr).get.asInstanceOf[Map[String, Any]]
+
+      consume(brokerInfo.get("host").get.asInstanceOf[String], brokerInfo.get("port").get.asInstanceOf[Int]
+        , 100000, 64 * 1024, clientId){consumer =>
+        val message = fetchMessage(consumer, clientId, topic, par, offset)
+        map.put((tp, offset), message)
+      }
+    }}
+    map.toMap
+  }
+
+  def fetchMessage(consumer: SimpleConsumer, clientId: String, topic: String, par: Int, offset: Long): String ={
+    val request = new FetchRequestBuilder().clientId(clientId).addFetch(topic, par, offset, 100000).build()
+    val response = consumer.fetch(request)
+    if(response.hasError){
+      // 有异常
+      return null
+    }
+    else {
+      for(mo <- response.messageSet(topic, par)){
+        if(mo.offset < offset){
+
+        } else {
+          val payload = mo.message.payload
+          val bytes = new Array[Byte](payload.limit())
+          payload.get(bytes)
+          val message = new String(bytes, "UTF-8")
+          return message
+        }
+      }
+    }
+    null
+  }
+
+
+
 
   /**
-    * 获取topic 对应分区的偏移量
+    * 从zk获取offset
+    */
+  def getOffsetFromZK(groupId:String, topicMetadataSeq:Seq[TopicMetadata],zkUtils:ZkUtils): Map[(String,TopicAndPartition),(Long)] ={
+    //定义返回
+    val groupTopicPartitionOffset = mutable.Map[(String,TopicAndPartition),(Long)]()
+
+    if(! topicMetadataSeq.isEmpty){
+      topicMetadataSeq.foreach(tm=>{
+        var topic = tm.topic
+        tm.partitionsMetadata.foreach(pm=>{
+          println("************ partition id" + pm.partitionId)
+          var tp = new TopicAndPartition(topic,pm.partitionId)
+          println("************ topicAndPartition" + tp)
+          //从ZK获取 zkOffset
+          val topicDirs = new ZKGroupTopicDirs(groupId, tp.topic)
+          println("************ group and topic dir" + topicDirs)
+          //zk上消费的路径的路径
+          val zkPath = s"${topicDirs.consumerOffsetDir}/${tp.partition}"
+          println("***** zkPath" + zkPath)
+          val zkOffset = zkUtils.readDataMaybeNull(zkPath)._1
+          println("*****" + zkOffset)
+          var offset = zkOffset match {
+            case Some(of) =>{
+              groupTopicPartitionOffset += (((groupId,tp),of.toLong))
+            }
+            case None =>{
+              groupTopicPartitionOffset += (((groupId,tp),0))
+            }
+          }
+        })
+      })
+    }
+    //zkUtils.close()
+    groupTopicPartitionOffset.toMap
+  }
+
+
+  /**
+    * 获取topic 对应分区的最新的偏移量
+    * @param soTimeout
+    * @param soBufferSize
+    * @param clientId
+    * @param topicMetadataSeq
+    * @param brokerZkUtils
+    * @return
+    */
+  def getTopicAndPartitionLastTimeOffsetInfo(soTimeout:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, Long] ={
+    //定义返回
+    val tpsAndPrts = mutable.Map[TopicAndPartition, Long]()
+
+    if(! topicMetadataSeq.isEmpty){
+      topicMetadataSeq.foreach(tm =>{
+        var topic = tm.topic
+        tm.partitionsMetadata.foreach(pm =>{
+          var tp = new TopicAndPartition(topic,pm.partitionId)
+          // 从zk找到该分区的leader broker的信息
+          val brokerId = brokerZkUtils.getLeaderForPartition(topic, pm.partitionId).get
+          println("****** broker id" + brokerId)
+          val brokerInfoStr = brokerZkUtils.readDataMaybeNull(ZkUtils.BrokerIdsPath + "/" + brokerId)._1.get
+          val brokerInfo = Json.parseFull(brokerInfoStr).get.asInstanceOf[Map[String, Any]]
+          println("****** broker info" + brokerInfoStr)
+          //通过消费者的方式获取初始偏移和最新偏移
+          var offset = getOffsetsByConsumer(brokerInfo.get("host").get.asInstanceOf[String],brokerInfo.get("port").get.asInstanceOf[Int],soTimeout,soBufferSize,clientId,tp);
+          tpsAndPrts += ((tp,offset._2))
+        })
+      })
+    }
+    //brokerZkUtils.close()
+    tpsAndPrts.toMap
+  }
+
+
+
+
+  /**
+    * 获取topic 对应分区的偏移量-最早偏移量，最新偏移量
+    * 通过api 的方式
     * @return
     */
   def getTopicAndPartitionOffsetInfo(soTimeout:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, (Long, Long)] ={
@@ -59,14 +187,17 @@ object KafkaUtils {
           var tp = new TopicAndPartition(topic,pm.partitionId)
           // 从zk找到该分区的leader broker的信息
           val brokerId = brokerZkUtils.getLeaderForPartition(topic, pm.partitionId).get
+          println("****** broker id" + brokerId)
           val brokerInfoStr = brokerZkUtils.readDataMaybeNull(ZkUtils.BrokerIdsPath + "/" + brokerId)._1.get
           val brokerInfo = Json.parseFull(brokerInfoStr).get.asInstanceOf[Map[String, Any]]
+          println("****** broker info" + brokerInfoStr)
           //通过消费者的方式获取初始偏移和最新偏移
           var offset = getOffsetsByConsumer(brokerInfo.get("host").get.asInstanceOf[String],brokerInfo.get("port").get.asInstanceOf[Int],soTimeout,soBufferSize,clientId,tp);
           tpsAndPrts += ((tp,offset))
         })
       })
     }
+    //brokerZkUtils.close()
     tpsAndPrts.toMap
   }
 

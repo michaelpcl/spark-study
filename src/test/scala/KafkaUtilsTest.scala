@@ -14,14 +14,27 @@ class KafkaUtilsTest extends TestCase{
       var soTimeout = 3000
       var soBufferSize = 6500
 
+      var groupId = conf.get(Constants.GROUP_ID)
+
       var topicMetadataSeq = KafkaUtils.getTopicMetadata(topics, brokers, clientId, soTimeout, soBufferSize)
-      println(topicMetadataSeq)
+      //println(topicMetadataSeq)
 
       var brokerZkUtils = KafkaUtils.getKafkaBrokerZkUtils(conf)
-      println(brokerZkUtils)
+      //println(brokerZkUtils)
 
       var topicPartitionOffset = KafkaUtils.getTopicAndPartitionOffsetInfo(soTimeout,soBufferSize,clientId,topicMetadataSeq,brokerZkUtils)
-      println(topicPartitionOffset)
+      //println(topicPartitionOffset)
+
+      var zkUtils = KafkaUtils.getZkUtils(conf)
+
+      var offsetFromZK = KafkaUtils.getOffsetFromZK(groupId,topicMetadataSeq,zkUtils)
+
+      //println(offsetFromZK)
+
+      var topicPartitionLastTimeOffset = KafkaUtils.getTopicAndPartitionLastTimeOffsetInfo(soTimeout,soBufferSize,clientId,topicMetadataSeq,brokerZkUtils)
+
+      var topicAndPartitionMessageMap = KafkaUtils.getMessage(topicPartitionLastTimeOffset,clientId,brokerZkUtils)
+      println(topicAndPartitionMessageMap);
    }
 
 
