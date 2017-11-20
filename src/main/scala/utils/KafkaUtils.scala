@@ -5,13 +5,14 @@ import kafka.common.{ErrorMapping, TopicAndPartition}
 import kafka.consumer.SimpleConsumer
 import kafka.utils.{Json, ZKGroupTopicDirs, ZkUtils}
 import org.apache.kafka.common.security.JaasUtils
+import org.apache.log4j.Logger
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
 
 object KafkaUtils {
   //定义操作日志
-  //var  logger :Logger = new Logger("kafkaUtils object");
+  //private var  logger :Logger = new Logger();
 
   /**
     * 获取操作kafka的ZKUtils
@@ -71,7 +72,7 @@ object KafkaUtils {
   }
 
   def fetchMessage(consumer: SimpleConsumer, clientId: String, topic: String, par: Int, offset: Long): String ={
-    val request = new FetchRequestBuilder().clientId(clientId).addFetch(topic, par, offset, 100000).build()
+    val request = new FetchRequestBuilder().clientId(clientId).addFetch(topic, par, offset, 10000000).build()
     val response = consumer.fetch(request)
     if(response.hasError){
       // 有异常
@@ -94,22 +95,111 @@ object KafkaUtils {
   }
 
 
-
-
   /**
-    * 从zk获取offset
+    * 获取指定topic 指定partition 当前消费到的偏移量
+    * @param topicMetadataSeq
+    * @param brokerZkUtils
+    * @param zkUtils
+    * @return
     */
-  def getOffsetFromZK(groupId:String, topicMetadataSeq:Seq[TopicMetadata],zkUtils:ZkUtils): Map[(String,TopicAndPartition),(Long)] ={
-    //定义返回
-    val groupTopicPartitionOffset = mutable.Map[(String,TopicAndPartition),(Long)]()
+  def getConsumerOffsetAndCommitOffset(topicMetadataSeq:Seq[TopicMetadata], brokerZkUtils:ZkUtils, zkUtils:ZkUtils,soTimeout: Int, soBufferSize: Int, clientId: String, groupId: String,autoOffsetReset:String):  Map[TopicAndPartition,Long] ={
+    var resultMap = mutable.Map[String,Map[TopicAndPartition,Long]]()
+    //当前消费到的主题、分区、偏移量的映射关系
+    val consumeredTopicAndPartitionOffsetMap = mutable.Map[TopicAndPartition, Long]()
+    //待提交的主题、分区、偏移量的映射关系
+    val commitTopicAndPartitionOffsetMap = mutable.Map[TopicAndPartition, Long]()
 
     if(! topicMetadataSeq.isEmpty){
       topicMetadataSeq.foreach(tm=>{
         var topic = tm.topic
+        tm.partitionsMetadata.foreach(pm=> {
+          //println("************ partition id" + pm.partitionId)
+          var tp = new TopicAndPartition(topic, pm.partitionId)
+          // 从zk找到该分区的leader broker的信息
+          val brokerId = brokerZkUtils.getLeaderForPartition(topic, pm.partitionId).get
+          val brokerInfoStr = brokerZkUtils.readDataMaybeNull(ZkUtils.BrokerIdsPath + "/" + brokerId)._1.get
+          val brokerInfo = Json.parseFull(brokerInfoStr).get.asInstanceOf[Map[String, Any]]
+
+          val offsets = getOffsetsByConsumer(brokerInfo.get("host").get.asInstanceOf[String], brokerInfo.get("port").get.asInstanceOf[Int]
+            , soTimeout, soBufferSize, clientId, tp)
+
+          // 4. 从ZK获取 zkOffset
+          val topicDirs = new ZKGroupTopicDirs(groupId, tp.topic)
+          // zk上消费的路径的路径
+          val zkPath = s"${topicDirs.consumerOffsetDir}/${tp.partition}"
+          val zkOffset = zkUtils.readDataMaybeNull(zkPath)._1
+          val offset = zkOffset match {
+            case Some(of) =>
+              if(of.toLong <= offsets._2 && of.toLong >= offsets._1){
+                of.toLong
+              } else if(of.toLong < offsets._1){
+                commitTopicAndPartitionOffsetMap.put(tp, offsets._1)
+                offsets._1
+              } else {
+                commitTopicAndPartitionOffsetMap.put(tp, offsets._2)
+                offsets._2
+              }
+            case None =>
+              if(autoOffsetReset.equals("smallest")){
+                commitTopicAndPartitionOffsetMap.put(tp, offsets._1)
+                offsets._1
+              } else {
+                commitTopicAndPartitionOffsetMap.put(tp, offsets._2)
+                offsets._2
+              }
+          }
+          //topic下各分区当前消费的偏移量
+          consumeredTopicAndPartitionOffsetMap += ((tp, offset))
+        })
+      })
+    }
+    resultMap.put("consumerOffset",consumeredTopicAndPartitionOffsetMap.toMap)
+    resultMap.put("commitOffset",commitTopicAndPartitionOffsetMap.toMap)
+    println(resultMap);
+    consumeredTopicAndPartitionOffsetMap.toMap
+  }
+
+
+  /**
+    * 更新消费的偏移量
+    * 通过zk更新，消费的偏移量记录
+    */
+  def commitOffsets(offsets: Map[TopicAndPartition, Long], zkUtils:ZkUtils,groupId:String): Unit ={
+    // 遍历每一个offset
+    for((tpAndPart, offset) <- offsets){
+      try {
+        val topicDirs = new ZKGroupTopicDirs(groupId, tpAndPart.topic)
+        val zkPath = s"${topicDirs.consumerOffsetDir}/${tpAndPart.partition}"
+        // 更新 /consumers/[group]/offsets/[topic]/[partition]
+        zkUtils.updatePersistentPath(zkPath, offset.toString)
+      } catch {
+        case e: Exception =>
+          //logger.error(s"Exception during commit offset $offset for topic" + s"${tpAndPart.topic}, partition ${tpAndPart.partition}", e)
+         e.getMessage
+      }
+    }
+    zkUtils.close()
+  }
+
+
+
+
+  /**
+    * 从zk获取客户端已经消费的offset
+    * @param groupId
+    * @param topicMetadataSeq
+    * @param zkUtils
+    * @return
+    */
+  def getOffsetFromZK (groupId:String, topicMetadataSeq:Seq[TopicMetadata],zkUtils:ZkUtils): Map[TopicAndPartition,Long] ={
+    val topicPartitionOffset = mutable.Map[TopicAndPartition,Long]()
+    if(! topicMetadataSeq.isEmpty){
+      topicMetadataSeq.foreach(tm=>{
+        var topic = tm.topic
         tm.partitionsMetadata.foreach(pm=>{
-          println("************ partition id" + pm.partitionId)
+          //println("************ partition id" + pm.partitionId)
           var tp = new TopicAndPartition(topic,pm.partitionId)
-          println("************ topicAndPartition" + tp)
+          //println("************ topicAndPartition" + tp)
           //从ZK获取 zkOffset
           val topicDirs = new ZKGroupTopicDirs(groupId, tp.topic)
           println("************ group and topic dir" + topicDirs)
@@ -120,18 +210,26 @@ object KafkaUtils {
           println("*****" + zkOffset)
           var offset = zkOffset match {
             case Some(of) =>{
-              groupTopicPartitionOffset += (((groupId,tp),of.toLong))
+              topicPartitionOffset += ((tp,of.toLong))
             }
             case None =>{
-              groupTopicPartitionOffset += (((groupId,tp),0))
+              topicPartitionOffset += ((tp,0))
             }
           }
         })
       })
     }
-    //zkUtils.close()
-    groupTopicPartitionOffset.toMap
+    topicPartitionOffset.toMap
   }
+
+
+
+
+
+
+
+
+
 
 
   /**
@@ -160,7 +258,7 @@ object KafkaUtils {
           println("****** broker info" + brokerInfoStr)
           //通过消费者的方式获取初始偏移和最新偏移
           var offset = getOffsetsByConsumer(brokerInfo.get("host").get.asInstanceOf[String],brokerInfo.get("port").get.asInstanceOf[Int],soTimeout,soBufferSize,clientId,tp);
-          tpsAndPrts += ((tp,offset._2))
+          tpsAndPrts += ((tp,offset._1))
         })
       })
     }
@@ -176,7 +274,7 @@ object KafkaUtils {
     * 通过api 的方式
     * @return
     */
-  def getTopicAndPartitionOffsetInfo(soTimeout:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, (Long, Long)] ={
+  def getTopicAndPartitionFirstAndLasttimeOffsetInfo(soTimeout:Int,soBufferSize:Int,clientId:String,topicMetadataSeq:Seq[TopicMetadata],brokerZkUtils:ZkUtils) : Map[TopicAndPartition, (Long, Long)] ={
     //定义返回
     val tpsAndPrts = mutable.Map[TopicAndPartition, (Long, Long)]()
 
@@ -319,6 +417,45 @@ object KafkaUtils {
       }
       (parts(0), parts(1).toInt)
     }
+  }
+
+
+  /**
+    * 从zk获取offset
+    * 然后封装成特定的map
+    */
+  def getOffsetFromZKByGroup(groupId:String, topicMetadataSeq:Seq[TopicMetadata],zkUtils:ZkUtils): Map[(String,TopicAndPartition),(Long)] ={
+    //定义返回
+    val groupTopicPartitionOffset = mutable.Map[(String,TopicAndPartition),(Long)]()
+
+    if(! topicMetadataSeq.isEmpty){
+      topicMetadataSeq.foreach(tm=>{
+        var topic = tm.topic
+        tm.partitionsMetadata.foreach(pm=>{
+          println("************ partition id" + pm.partitionId)
+          var tp = new TopicAndPartition(topic,pm.partitionId)
+          println("************ topicAndPartition" + tp)
+          //从ZK获取 zkOffset
+          val topicDirs = new ZKGroupTopicDirs(groupId, tp.topic)
+          println("************ group and topic dir" + topicDirs)
+          //zk上消费的路径的路径
+          val zkPath = s"${topicDirs.consumerOffsetDir}/${tp.partition}"
+          println("***** zkPath" + zkPath)
+          val zkOffset = zkUtils.readDataMaybeNull(zkPath)._1
+          println("*****" + zkOffset)
+          var offset = zkOffset match {
+            case Some(of) =>{
+              groupTopicPartitionOffset += (((groupId,tp),of.toLong))
+            }
+            case None =>{
+              groupTopicPartitionOffset += (((groupId,tp),0))
+            }
+          }
+        })
+      })
+    }
+    //zkUtils.close()
+    groupTopicPartitionOffset.toMap
   }
 
 }

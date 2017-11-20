@@ -1,4 +1,6 @@
 import junit.framework.TestCase
+import kafka.api.TopicMetadata
+import kafka.utils.ZkUtils
 import utils.{BaseConfiguration, Configuration, Constants, KafkaUtils}
 
 
@@ -13,6 +15,8 @@ class KafkaUtilsTest extends TestCase{
       var topics = conf.get(Constants.TOPICS).toString.split(",").toSet
       var soTimeout = 3000
       var soBufferSize = 6500
+      // 默认读取最新的消息
+      val autoOffsetReset = conf.getOrElse("auto.offset.reset", "largest").toLowerCase
 
       var groupId = conf.get(Constants.GROUP_ID)
 
@@ -22,18 +26,22 @@ class KafkaUtilsTest extends TestCase{
       var brokerZkUtils = KafkaUtils.getKafkaBrokerZkUtils(conf)
       //println(brokerZkUtils)
 
-      var topicPartitionOffset = KafkaUtils.getTopicAndPartitionOffsetInfo(soTimeout,soBufferSize,clientId,topicMetadataSeq,brokerZkUtils)
+      var topicPartitionFirstLasttimeOffset = KafkaUtils.getTopicAndPartitionFirstAndLasttimeOffsetInfo(soTimeout,soBufferSize,clientId,topicMetadataSeq,brokerZkUtils)
       //println(topicPartitionOffset)
 
       var zkUtils = KafkaUtils.getZkUtils(conf)
 
-      var offsetFromZK = KafkaUtils.getOffsetFromZK(groupId,topicMetadataSeq,zkUtils)
+      var offsetFromZK = KafkaUtils.getOffsetFromZKByGroup(groupId,topicMetadataSeq,zkUtils)
 
       //println(offsetFromZK)
 
       var topicPartitionLastTimeOffset = KafkaUtils.getTopicAndPartitionLastTimeOffsetInfo(soTimeout,soBufferSize,clientId,topicMetadataSeq,brokerZkUtils)
 
-      var topicAndPartitionMessageMap = KafkaUtils.getMessage(topicPartitionLastTimeOffset,clientId,brokerZkUtils)
+      var topicPartitionOffset = KafkaUtils.getConsumerOffsetAndCommitOffset(topicMetadataSeq, brokerZkUtils, zkUtils,soTimeout, soBufferSize, clientId, groupId,autoOffsetReset)
+      println(topicPartitionOffset);
+
+      var topicAndPartitionMessageMap = KafkaUtils.getMessage(topicPartitionOffset,clientId,brokerZkUtils)
+
       println(topicAndPartitionMessageMap);
    }
 
